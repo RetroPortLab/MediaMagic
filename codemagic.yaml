@@ -1,0 +1,95 @@
+# Codemagic builds for ShelfLife.
+#
+# 1. shelflife-unsigned  — no Apple account needed. Proves the code compiles,
+#    then makes an unsigned .ipa you can install with Sideloadly/AltStore
+#    using a free Apple ID.
+# 2. shelflife-testflight — needs a paid Apple Developer account. Signs the
+#    app and sends it to TestFlight so you can install it from the TestFlight app.
+
+workflows:
+  shelflife-unsigned:
+    name: ShelfLife — compile + unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment:
+      xcode: latest
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "*"
+    scripts:
+      - name: Generate Xcode project
+        script: |
+          brew install xcodegen
+          xcodegen generate
+      - name: Compile for the iOS Simulator (catches code errors)
+        script: |
+          set -o pipefail
+          xcodebuild \
+            -project ShelfLife.xcodeproj \
+            -scheme ShelfLife \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Debug \
+            -derivedDataPath build/sim \
+            build | tee build-sim.log | grep -E "error:|warning:|BUILD" || true
+          grep -q "BUILD SUCCEEDED" build-sim.log
+      - name: Build unsigned device app and package as .ipa
+        script: |
+          set -o pipefail
+          xcodebuild \
+            -project ShelfLife.xcodeproj \
+            -scheme ShelfLife \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -derivedDataPath build/device \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build | tee build-device.log | grep -E "error:|BUILD" || true
+          grep -q "BUILD SUCCEEDED" build-device.log
+          rm -rf Payload && mkdir Payload
+          cp -R build/device/Build/Products/Release-iphoneos/ShelfLife.app Payload/
+          zip -qry ShelfLife-unsigned.ipa Payload
+    artifacts:
+      - ShelfLife-unsigned.ipa
+      - build-sim.log
+      - build-device.log
+
+  shelflife-testflight:
+    name: ShelfLife — signed TestFlight build
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    integrations:
+      # Name of your App Store Connect API key in Codemagic → Team settings → Integrations.
+      app_store_connect: ShelfLife ASC key
+    environment:
+      xcode: latest
+      groups:
+        - signing          # holds CERTIFICATE_PRIVATE_KEY
+      vars:
+        BUNDLE_ID: "uk.yourname.shelflife"   # must match the app you made in App Store Connect
+    triggering:
+      events:
+        - tag
+    scripts:
+      - name: Generate Xcode project with your bundle ID and build number
+        script: |
+          brew install xcodegen
+          sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER: .*/PRODUCT_BUNDLE_IDENTIFIER: $BUNDLE_ID/" project.yml
+          sed -i '' "s/CURRENT_PROJECT_VERSION: .*/CURRENT_PROJECT_VERSION: \"$BUILD_NUMBER\"/" project.yml
+          xcodegen generate
+      - name: Set up code signing
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
+          keychain add-certificates
+          xcode-project use-profiles
+      - name: Build signed .ipa
+        script: |
+          xcode-project build-ipa --project ShelfLife.xcodeproj --scheme ShelfLife
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
